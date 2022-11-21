@@ -48,6 +48,6 @@ def GeneralizedProcrustes(Shapes, error = 1e-1, maxIter = 10):
         if dist < error:
             print(f'Tolerance achieved in {iter} iterations. Stopping the alignement procedure.')
             break
-
+    newShapes[0] = refShape
     return newShapes
 
