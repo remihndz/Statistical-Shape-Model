@@ -4,6 +4,7 @@ from scipy.linalg import svd
 from sklearn.decomposition import PCA
 from numpy.linalg import eig
 import os
+import networkx as nx
 
 
 
@@ -83,6 +84,120 @@ class PointDistributionModel:
             newShapes.append(xn)
         return newShapes
         
+    @staticmethod
+    def ToCCO(shape : list, CCOFileName : str, span : float=2.0, radiusCRA : float = 7e-3, nLandmarks : tuple=(None, None), **kwargs):
+        """
+        Write the vessel landmarks in shape as a new CCO file. 
+        Assumes the first point in the list is the CR vessel's location while the remaining points are the superior and inferior temporal vessel.
+        Both superior and inferior vessels are assumed to be composed of the same number of landmarks by default.
+        If not, specify those numbers in landmarks.
+
+        Argument:
+            shape : list
+                the list of 2D points (image landmarks)
+            CCOFileName : str
+                the output file name
+            nLandmarks : tuple
+                the number of landmark for each vessel in the shape
+            span : float
+                the axial length of the vessels (in cm)
+        """
+
+        CRVessel = np.pad(shape[0][:2], (0,1)).reshape((3,))
+        # Various tree info in the header of the CCO file
+        qProx = kwargs.get('qProx', 2.5000000000000001e-04) # 15 microliter/min in cm3/s, probably
+        psiFactor = kwargs.get('psiFactor', 9.6040000000001100e-06) # Not sure what that does
+        dp = kwargs.get('dp', 9.5453193691098149e+03) # Pressure drop from the single inlet to all outlet vessels, in Pa
+        refPressure = kwargs.get('refPressure', 6.6661199999999999e+03) # Occular perfusion pressure, 50mmHg in Pa
+        nTerms = 2
+
+        if nLandmarks[0]:
+            superiorVessel = shape[1:nLandmarks[0]+1]
+            if nLandmarks[1]:
+                inferiorVessel = shape[nLandmarks[0]+1 : nLandmarks[0]+nLandmarks[1]+1]
+            else:
+                inferiorVessel = shape[nLandmarks[0]+1:]
+        else:
+            nLandmarks = int(len(shape-1)/2)
+            superiorVessel = shape[1:nLandmarks[0]+1]
+            inferiorVessel = shape[nLandmarks[0]+1:]
+        
+        # Create the central retinal vessel (out of the plane) to link both vessel to a single inlet
+        G = nx.DiGraph()
+        G.add_node(0, position=np.array([CRVessel[0], CRVessel[1], -0.1])) # The inlet node
+        G.add_node(1, position=CRVessel)
+        G.add_edge(0, 1, radius = radiusCRA, key = 0)
+        
+        # Add the superior temporal vessel
+        nProx = 1 # The key of the distal node of the CRVessel
+        nodeKey = 2 # Available node key for G
+        vesselKey = 1 # Available vessel key for G
+        for x in superiorVessel:
+            x = np.pad(x, (0,1)) # Position of the distal node
+            G.add_node(nodeKey, position=x) 
+            G.add_edge(nProx, nodeKey, radius = radiusCRA/2.0, key = vesselKey) # All vessel segments have the same width
+            nProx = nodeKey
+            nodeKey +=1
+            vesselKey +=1
+
+        # Add the inferior vessel
+        nProx = 1 # Reset the proximal end to be the CRA
+        for x in inferiorVessel:
+            x = np.pad(x, (0,1)) # Position of the distal node
+            G.add_node(nodeKey, position=x) 
+            G.add_edge(nProx, nodeKey, radius = radiusCRA/2.0, key = vesselKey) # All vessel segments have the same width
+            nProx = nodeKey
+            nodeKey +=1
+            vesselKey +=1
+        
+        with open(CCOFileName, 'w') as f:
+            f.write('*Tree\n')
+            x = G.nodes[0]['position']
+            f.write(f"{x[0]} {x[1]} {x[2]} {qProx} {psiFactor} {dp} {nTerms} {refPressure} {G.number_of_nodes()} {radiusCRA} {1e-6}\n")
+
+            f.write('\n*Vessels\n')
+            f.write(f"{G.number_of_edges()}\n")
+            for n1, n2, data in G.edges(data=True):
+                xProx, xDist = G.nodes[n1]['position'], G.nodes[n2]['position']
+                branchingMode = 3 if data['key']==0 else 2 # If the root, then bifurcates at distal end only, else deformable parent
+                vesselFunction = 0 # Distribution vessel, bifurcates in the domain only
+                f.write(f"{data['key']} {xProx[0]} {xProx[1]} {xProx[2]} {xDist[0]} {xDist[1]} {xDist[2]}")
+                f.write(f"0.0 0.0 0.0 0.0 {branchingMode} {data['radius']} {qProx} 0.0 0.0 0.0 {vesselFunction} 0.0 0.0 0\n")
+
+            f.write('\n*Connectivity')
+            for n1, n2, data in G.edges(data=True):
+                f.write('\n')
+
+                # Sanity check
+                parent = G.predecessors(n1)
+                assert sum(1 for _ in parent) <= 1, f'Oops... Something went wrong, more than 1 parent was found {parent=}.'
+                descendents = G.successors(n2) 
+                assert sum(1 for _ in descendents) <= 2, f'Oops... Something went wrong, more than 2 descendents were found {descendents=}.' 
+                # End sanity check 
+
+                parent = G.predecessors(n1)
+                descendents = G.successors(n2) 
+                try: 
+                    parentKey = next(parent)
+                except:
+                    parentKey = -1
+                f.write(f"{data['key']} {parentKey}")                    
+                
+                for descendent in descendents:
+                    f.write(f" {G[n2][descendent]['key']}")
+            
+
+
+
+
+
+
+            
+        
+        
+
+
+
 
     @staticmethod
     def GeneralizedProcrustesAnalysis(Shapes:list, error = 1e-1, maxIter = 10) -> list:
@@ -111,80 +226,3 @@ class PointDistributionModel:
                 break
         newShapes[0] = refShape
         return newShapes, meanShape.reshape((-1,))
-
-    
-
-    
-    # @staticmethod
-    # def to_cco(filename, CRA : point, vessels : list, vesselsType = 'DEFORMABLE_PARENT'):
-    #     """
-    #     Write vessels in cco format filename.
-
-    #     Arguments:
-    #     ----------
-    #     filename: the name of the file to save the tree
-    #     CRA: the location of the CRA, used as root for each vessel in vessels
-    #     vessels: a list of list or lists of numpy arrays containing the points (excluding CRA) forming a vessel     
-    #     """
-                    
-    #     ## TODO use a proper length and radius for the CRA 
-    #     # Use the length of a vessel segment as an estimate of the CRA's length (because unit is unknown)
-
-    #     if isinstance(vessels[0], float):
-    #         vesselsList = [vessels]
-    #     elif isinstance(vessels, list):
-    #         vesselsList = vessels
-    #     else:
-    #         raise ValueError("Please provide a valide list of arrays or a single array.")
-        
-    #     lengthFirstVessel = np.linalg.norm(np.array(vesselsList[0][1])-np.array(vesselsList[0][0]))*3
-    #     xperf  = np.array(CRA)-np.array([0.0,0.0,lengthFirstVessel])
-    #     qProx  = 2.5e-4 # muL/min? Taken from the results of the DCCO algorithm
-    #     psiFr  = 9.6e-6 # psiFactor
-    #     dp     = 50*133.3 # Pa
-    #     nTerms = len(vesselsList)
-
-    #     refPressure = 18*133.3 # Pa
-    #     rootRadius  = 7e-3    # in cm = 70microns
-    #     variationTol = 1e-6
-
-    #     branchingTypeDir = {'NO_BRANCHING':0,
-    #                         'RIGID_PARENT':1,
-    #                         'DEFORMABLE_PARENT':2,
-    #                         'DISTAL_BRANCHING':3,
-    #                         'ONLY_AT_PARENT_HOTSPOTS':4}
-    #     branchingType = branchingTypeDir[vesselsType]
-
-
-    #     nSegments = 1 # The CRA
-    #     for vessel in vessels:
-    #         nSegments += np.array(vesselsList).size
-
-    #     nSegment += len(vesselsList)
-            
-    #     with open(filename, 'w') as f:
-
-    #         f.write("*Tree\n")
-    #         f.write(f"{xperf[0]} {xperf[1]} {xperf[2]} {qProx} {psiFr} {dp} {nTerms} {refPressure} 1 {rootRadius} {variationTol}\n")
-
-    #         f.write("\n*Vessels\n")
-    #         f.write(f"{nSegments}\n")
-
-    #         vesselId = 0
-    #         stage    = 0
-    #         vesselConnectivity = dict()
-    #         vesselConnectivity[0] = [-1]
-            
-            
-    #         f.write(f"0 {xperf[0]} {xperf[1]} {xperf[2]} {CRA[0]} {CRA[1]} {CRA[2]} 0.0 0.0 0.0 0.0 3 {rootRadius} {qProx} 0.0 0.0 0.0 0 0.0 0.0 {stage}")
-    #         stage+=1
-    #         vesselId+=1
-            
-    #         for vessel in vesselsList:
-    #             xProx, parent = np.array(CRA), 0
-    #             vessel = np.array(vessel).ravel().reshape((-1,2))
-    #             for i in range(np.array(vessel).ravel().size):
-    #                 distalPoint = vessel[i, :]
-    #                 vesselConnectivity[vesselId] = [parent]
-                
-        
